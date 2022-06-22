@@ -17,6 +17,8 @@ type VpcInput struct {
 	PrivateSubnetCidrBlocks []string
 	PublicSubnetCidrBlocks  []string
 
+	FlowLogsConfig *FlowLogConfig
+
 	Tags map[string]string
 }
 
@@ -35,6 +37,23 @@ type VpcOutput struct {
 
 	NatGateway      *ec2.NatGateway
 	InternetGateway *ec2.InternetGateway
+}
+
+type FlowLogConfig struct {
+	Enabled bool
+
+	TrafficType pulumi.StringInput
+
+	LogDestinationType pulumi.StringPtrInput
+	LogDestination     pulumi.StringPtrInput
+
+	DestinationOptions *FlowLogDestinationOptions
+}
+
+type FlowLogDestinationOptions struct {
+	FileFormat               pulumi.StringPtrInput
+	HiveCompatiblePartitions pulumi.BoolPtrInput
+	PerHourPartition         pulumi.BoolPtrInput
 }
 
 func NewVpc(ctx *pulumi.Context, input *VpcInput) (*VpcOutput, error) {
@@ -65,6 +84,12 @@ func NewVpc(ctx *pulumi.Context, input *VpcInput) (*VpcOutput, error) {
 		}
 	}
 
+	if input.FlowLogsConfig != nil && input.FlowLogsConfig.Enabled {
+		if _, err := newFlowLog(ctx, input, output); err != nil {
+			return nil, fmt.Errorf("while creating flow log: %w", err)
+		}
+	}
+
 	return output, nil
 }
 
@@ -73,15 +98,15 @@ func newPublicSubnets(ctx *pulumi.Context, input *VpcInput, output *VpcOutput) e
 
 	vpcID := output.Vpc.ID()
 
-	output.InternetGateway, err = ec2.NewInternetGateway(ctx, "igw", &ec2.InternetGatewayArgs{
+	output.InternetGateway, err = ec2.NewInternetGateway(ctx, input.Name, &ec2.InternetGatewayArgs{
 		VpcId: vpcID,
-		Tags:  pulumi.ToStringMap(utils.WithNameTag(input.Tags, "igw")),
+		Tags:  pulumi.ToStringMap(utils.WithNameTag(input.Tags, input.Name)),
 	})
 	if err != nil {
 		return err
 	}
 
-	rt, err := ec2.NewRouteTable(ctx, "public-rt", &ec2.RouteTableArgs{
+	rt, err := ec2.NewRouteTable(ctx, fmt.Sprintf("%s-public", input.Name), &ec2.RouteTableArgs{
 		VpcId: vpcID,
 		Routes: ec2.RouteTableRouteArray{
 			ec2.RouteTableRouteArgs{
@@ -89,7 +114,7 @@ func newPublicSubnets(ctx *pulumi.Context, input *VpcInput, output *VpcOutput) e
 				GatewayId: output.InternetGateway.ID(),
 			},
 		},
-		Tags: pulumi.ToStringMap(utils.WithNameTag(input.Tags, "public-rt")),
+		Tags: pulumi.ToStringMap(utils.WithNameTag(input.Tags, fmt.Sprintf("%s-public", input.Name))),
 	})
 	if err != nil {
 		return err
@@ -100,7 +125,7 @@ func newPublicSubnets(ctx *pulumi.Context, input *VpcInput, output *VpcOutput) e
 	for i, cidr := range input.PublicSubnetCidrBlocks {
 		az := input.AvailabilityZones[i]
 
-		name := fmt.Sprintf("%s-%d", "public-subnet", i)
+		name := fmt.Sprintf("%s-public-subnet-%d", input.Name, i)
 		subnet, err := ec2.NewSubnet(ctx, name, &ec2.SubnetArgs{
 			VpcId:            output.Vpc.ID(),
 			CidrBlock:        pulumi.String(cidr),
@@ -128,7 +153,7 @@ func newPrivateSubnets(ctx *pulumi.Context, input *VpcInput, output *VpcOutput) 
 	routes := make(ec2.RouteTableRouteArray, 0)
 
 	if output.PublicSubnets != nil {
-		eip, err := ec2.NewEip(ctx, "nat-eip", &ec2.EipArgs{
+		eip, err := ec2.NewEip(ctx, fmt.Sprintf("%s-nat-eip", input.Name), &ec2.EipArgs{
 			Vpc: pulumi.Bool(true),
 		})
 		if err != nil {
@@ -137,7 +162,7 @@ func newPrivateSubnets(ctx *pulumi.Context, input *VpcInput, output *VpcOutput) 
 
 		subnetID := output.PublicSubnets[0].ID()
 
-		output.NatGateway, err = ec2.NewNatGateway(ctx, "nat-gw", &ec2.NatGatewayArgs{
+		output.NatGateway, err = ec2.NewNatGateway(ctx, fmt.Sprintf("%s-nat-eip", input.Name), &ec2.NatGatewayArgs{
 			SubnetId:     subnetID,
 			AllocationId: eip.ID(),
 			Tags:         pulumi.ToStringMap(input.Tags),
@@ -152,10 +177,10 @@ func newPrivateSubnets(ctx *pulumi.Context, input *VpcInput, output *VpcOutput) 
 		})
 	}
 
-	rt, err := ec2.NewRouteTable(ctx, "private-rt", &ec2.RouteTableArgs{
+	rt, err := ec2.NewRouteTable(ctx, fmt.Sprintf("%s-private", input.Name), &ec2.RouteTableArgs{
 		VpcId:  output.Vpc.ID(),
 		Routes: routes,
-		Tags:   pulumi.ToStringMap(utils.WithNameTag(input.Tags, "private-rt")),
+		Tags:   pulumi.ToStringMap(utils.WithNameTag(input.Tags, fmt.Sprintf("%s-private", input.Name))),
 	})
 	if err != nil {
 		return err
@@ -166,7 +191,7 @@ func newPrivateSubnets(ctx *pulumi.Context, input *VpcInput, output *VpcOutput) 
 	for i, cidr := range input.PrivateSubnetCidrBlocks {
 		az := input.AvailabilityZones[i]
 
-		name := fmt.Sprintf("%s-%d", "private-subnet", i)
+		name := fmt.Sprintf("%s-private-subnet-%d", input.Name, i)
 		subnet, err := ec2.NewSubnet(ctx, name, &ec2.SubnetArgs{
 			VpcId:            output.Vpc.ID(),
 			CidrBlock:        pulumi.String(cidr),
@@ -188,4 +213,26 @@ func newPrivateSubnets(ctx *pulumi.Context, input *VpcInput, output *VpcOutput) 
 	}
 
 	return nil
+}
+
+func newFlowLog(ctx *pulumi.Context, input *VpcInput, output *VpcOutput) (*ec2.FlowLog, error) {
+	var destionationOpts ec2.FlowLogDestinationOptionsPtrInput
+
+	if input.FlowLogsConfig.DestinationOptions != nil {
+		destionationOpts = ec2.FlowLogDestinationOptionsArgs{
+			FileFormat:               input.FlowLogsConfig.DestinationOptions.FileFormat,
+			HiveCompatiblePartitions: input.FlowLogsConfig.DestinationOptions.HiveCompatiblePartitions,
+			PerHourPartition:         input.FlowLogsConfig.DestinationOptions.PerHourPartition,
+		}
+	}
+
+	flowLog, err := ec2.NewFlowLog(ctx, input.Name, &ec2.FlowLogArgs{
+		VpcId:              output.Vpc.ID(),
+		TrafficType:        input.FlowLogsConfig.TrafficType,
+		LogDestinationType: input.FlowLogsConfig.LogDestinationType,
+		LogDestination:     input.FlowLogsConfig.LogDestination,
+
+		DestinationOptions: destionationOpts,
+	})
+	return flowLog, err
 }
